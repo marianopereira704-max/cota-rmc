@@ -135,6 +135,12 @@ class AppConfig:
     key_alias_table: str = "matching/aliases_confirmados.json"
     key_pending_table: str = "matching/pendencias.json"
     key_rmc_catalog: str = "rmc/catalogo_laboratorios.json"
+    # Snapshot publicado da tabela final (dados publicados) — Parquet pelo
+    # volume real (ver modules/storage.py); metadados (quem/quando/col_map)
+    # à parte em JSON, por ser pequeno e precisar ser lido sem baixar o
+    # Parquet inteiro.
+    key_snapshot_tabela: str = "snapshot/tabela_final.parquet"
+    key_snapshot_metadata: str = "snapshot/metadata.json"
 
 
 def load_config() -> AppConfig:

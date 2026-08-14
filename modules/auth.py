@@ -289,13 +289,19 @@ def render_login_screen(app_name: str, cookies: CookieManager) -> None:
                 st.error(st.session_state["cotalogin_erro"])
 
 
-def render_logout_sidebar() -> None:
+def render_logout_sidebar(ultima_atualizacao: str | None = None) -> None:
     with st.sidebar:
         st.markdown("<div style='margin-top:20px; border-top:1px solid #E4E7EB; padding-top:12px;'></div>",
                      unsafe_allow_html=True)
         perfil = current_profile()
         if perfil:
             st.caption(f"Perfil: {perfil.capitalize()}")
+        # visível pros dois perfis: ajuda o consultor a saber se precisa
+        # republicar e o diretor a saber a idade do dado que está vendo.
+        if ultima_atualizacao:
+            st.caption(f"Última atualização: {ultima_atualizacao}")
+        else:
+            st.caption("Última atualização: nenhum dado publicado ainda")
         if st.button("Sair", key="cotarmc_logout", use_container_width=True):
             logout()
             st.rerun()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import io
+from datetime import datetime
 
 import streamlit as st
 import pandas as pd
@@ -29,6 +31,8 @@ from modules.business_rules import (
 )
 from modules.storage import SpacesClient, SpacesStorageError
 from modules.oportunidades_table import ler_ordenacao_atual, montar_pill, renderizar_tabela
+from modules import file_manager
+from modules import arquivos_ativos
 
 cfg = load_config()
 st.set_page_config(page_title=cfg.app_name, layout="wide")
@@ -82,6 +86,37 @@ def _load_lojas_movimento_cached(file, schema):
     return load_lojas_movimento(file, schema)
 
 
+# Variantes que leem o "arquivo ativo" do Space em vez de um upload novo —
+# cacheadas por (pasta, nome_arquivo, enviado_em): a mesma versão ativa não
+# é rebaixada de novo a cada rerun da página Dados (qualquer interação nela
+# reroda o script inteiro); uma nova publicação muda `enviado_em`, invalida
+# o cache sozinha. `_storage` com underscore = Streamlit não tenta hashear o
+# client (convenção da própria lib para argumentos não-hasheáveis).
+@st.cache_data(show_spinner="Lendo BASE_COMPLETA ativa do Space...")
+def _carregar_base_completa_ativa_cached(pasta: str, nome_arquivo: str, enviado_em: str, _storage):
+    conteudo = _storage.read_bytes(pasta + nome_arquivo)
+    if conteudo is None:
+        raise SpacesStorageError(f"Arquivo ativo '{nome_arquivo}' não encontrado em '{pasta}'.")
+    return load_base_completa(io.BytesIO(conteudo), cfg.schema)
+
+
+@st.cache_data(show_spinner="Lendo movimentação de lojas ativa do Space (pode levar 1-2 min para exports grandes)...")
+def _carregar_lojas_ativa_cached(pasta: str, nome_arquivo: str, enviado_em: str, _storage):
+    conteudo = _storage.read_bytes(pasta + nome_arquivo)
+    if conteudo is None:
+        raise SpacesStorageError(f"Arquivo ativo '{nome_arquivo}' não encontrado em '{pasta}'.")
+    return load_lojas_movimento(io.BytesIO(conteudo), cfg.schema)
+
+
+def _carregar_rmc_ativo(pasta: str, nome_arquivo: str, laboratorio: str, storage_client: SpacesClient):
+    # sem @st.cache_data de propósito — RMC já não era cacheado no fluxo de
+    # upload (tabelas pequenas), mantendo a mesma assimetria de hoje.
+    conteudo = storage_client.read_bytes(pasta + nome_arquivo)
+    if conteudo is None:
+        raise SpacesStorageError(f"Arquivo ativo '{nome_arquivo}' não encontrado em '{pasta}'.")
+    return load_rmc_table(io.BytesIO(conteudo), laboratorio, cfg.schema)
+
+
 def _load_aliases_df() -> pd.DataFrame:
     if storage is None:
         return pd.DataFrame(columns=ALIAS_COLUMNS)
@@ -105,6 +140,44 @@ def _load_pending_snapshot() -> pd.DataFrame:
     return storage.read_dataframe_json(cfg.key_pending_table, ["ean", "familia", "produto_rmc", "laboratorio_rmc"])
 
 
+def _publicar_snapshot(tabela: pd.DataFrame, col_map: dict[str, dict[str, str]]) -> dict:
+    """
+    Publica os "dados publicados": a tabela final JÁ PROCESSADA (não os 3
+    arquivos brutos) — Parquet, não JSON, pelo volume real medido antes de
+    decidir (~33MB em JSON contra ~0.7MB em Parquet pros mesmos ~61 mil
+    linhas; ver modules/storage.py). Metadados (quem/quando/col_map) à parte
+    em JSON — pequeno, e dá pra ler sem baixar o Parquet inteiro (usado pra
+    mostrar "Última atualização" em toda página sem custo).
+    """
+    if storage is None:
+        raise SpacesStorageError("Storage do Spaces não configurado nesta sessão.")
+    storage.write_dataframe_parquet(cfg.key_snapshot_tabela, tabela)
+    metadata = {
+        "publicado_por_perfil": auth.current_profile(),
+        "publicado_por_cnpj": st.secrets.get("auth", {}).get("cnpj", ""),
+        "publicado_em": datetime.now().isoformat(),
+        "qtd_linhas": len(tabela),
+        "fornecedores_col_map": col_map,
+    }
+    storage.write_json(cfg.key_snapshot_metadata, metadata)
+    return metadata
+
+
+def _carregar_snapshot_publicado() -> dict | None:
+    """Lê o último snapshot publicado (metadados + tabela). None quando
+    nunca publicaram nada ainda (primeiro uso do sistema) — quem chama
+    decide o estado vazio a partir disso, não é um erro."""
+    if storage is None:
+        return None
+    metadata = storage.read_json(cfg.key_snapshot_metadata, default=None)
+    if metadata is None:
+        return None
+    tabela = storage.read_dataframe_parquet(cfg.key_snapshot_tabela)
+    if tabela is None:
+        return None
+    return {"tabela": tabela, "col_map": metadata.get("fornecedores_col_map", {}), "metadata": metadata}
+
+
 # ---------------------------------------------------------------------------
 # Estado de sessão
 # ---------------------------------------------------------------------------
@@ -120,6 +193,23 @@ ss.setdefault("opv_estados_ativos", {ESTADO_NAO_COMPRA, ESTADO_COMPRA_MAIS_CARO,
 ss.setdefault("opv_pagina", 1)
 ss.setdefault("opv_pagina_ranking", 1)
 ss.setdefault("opv_ranking_expandido", set())
+ss.setdefault("snapshot_metadata", None)
+ss.setdefault("gerenciador_caminho", "")
+ss.setdefault("rmc_labs_excluidos_sessao", set())
+
+# Carrega o último snapshot publicado automaticamente ao entrar — só na
+# PRIMEIRA vez desta sessão que ninguém fez upload ainda (ss['tabela_final']
+# ausente). Guardado por '_snapshot_tentativa_feita' pra não tentar de novo
+# a cada rerun (cada clique/interação reexecuta este script inteiro) quando
+# nada foi publicado ainda: sem essa guarda, toda sessão sem snapshot bateria
+# no Spaces a cada interação, à toa.
+if "tabela_final" not in ss and not ss.get("_snapshot_tentativa_feita"):
+    ss["_snapshot_tentativa_feita"] = True
+    _snapshot_inicial = _carregar_snapshot_publicado()
+    if _snapshot_inicial is not None:
+        ss["tabela_final"] = _snapshot_inicial["tabela"]
+        ss["fornecedores_col_map"] = _snapshot_inicial["col_map"]
+        ss["snapshot_metadata"] = _snapshot_inicial["metadata"]
 
 
 def _recompute_pipeline():
@@ -156,6 +246,25 @@ def _recompute_pipeline():
     return match
 
 
+def _estado_vazio_tabela_final() -> None:
+    """Estado vazio claro (não erro, não tela em branco) pras páginas que
+    dependem de ss['tabela_final'] quando nem sessão local nem snapshot
+    publicado têm dado nenhum — cobre tanto 'primeiro uso do sistema' quanto
+    Storage do Spaces não configurado."""
+    if auth.current_profile() == auth.PERFIL_CONSULTOR:
+        st.info(
+            "Nenhum dado publicado ainda. Carregue os 3 arquivos na seção **Dados** para "
+            "processar — e publique de lá pra ficar disponível em todo login.",
+            icon="📭",
+        )
+    else:
+        st.info(
+            "Nenhum dado publicado ainda. Peça a um consultor para processar os arquivos e "
+            "publicar na seção Dados.",
+            icon="📭",
+        )
+
+
 def _filtros_tabela(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     """UF continua sendo filtro (não aparece mais como coluna na Tabela
     Principal, mas os dados de todas as UFs continuam lá por baixo)."""
@@ -181,6 +290,18 @@ def _filtros_tabela(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
 # Seção: Configurações
 # ---------------------------------------------------------------------------
 def pagina_configuracoes():
+    dados_vem_de_upload_nesta_sessao = (
+        ss["base_df"] is not None and ss["rmc_dfs"] and ss["lojas_df"] is not None
+    )
+    if "tabela_final" in ss and not dados_vem_de_upload_nesta_sessao:
+        st.info(
+            "Os dados atuais vêm de um **snapshot publicado**, não dos arquivos brutos desta "
+            "sessão — mudar os parâmetros abaixo **não** recalcula esse snapshot. Para aplicar "
+            "uma mudança, um consultor precisa reprocessar os 3 arquivos na aba Dados e "
+            "publicar de novo.",
+            icon="ℹ️",
+        )
+
     st.subheader("Parâmetros de cálculo")
     st.caption(
         "Esses valores controlam Risco de Ruptura e Pedido Sugerido em todo o app. "
@@ -224,52 +345,169 @@ def pagina_dados():
         st.error("Esta seção não está disponível para o seu perfil.", icon="🚫")
         return
 
+    # --- 1. BASE_COMPLETA -------------------------------------------------
     st.subheader("1. Base unificada de EAN (genéricos)")
-    base_file = st.file_uploader("BASE_COMPLETA.xlsx", type=["xlsx"], key="up_base")
-    if base_file is not None:
+    pasta_base = arquivos_ativos.pasta_base_completa()
+    ativo_base = arquivos_ativos.ler_ativo(storage, pasta_base) if storage is not None else None
+
+    if ativo_base is not None:
+        st.caption(f"BASE_COMPLETA atual: **{ativo_base.nome_arquivo}**, enviada em {ativo_base.enviado_em_fmt}")
+        modo_base = st.radio(
+            "O que fazer?", ["Usar este arquivo", "Enviar nova versão"],
+            key="modo_base", horizontal=True, label_visibility="collapsed",
+        )
+    else:
+        modo_base = "Enviar nova versão"
+
+    if modo_base == "Usar este arquivo":
         try:
-            df, report = _load_base_completa_cached(base_file, cfg.schema)
+            df, report = _carregar_base_completa_ativa_cached(
+                pasta_base, ativo_base.nome_arquivo, ativo_base.enviado_em, storage,
+            )
             ss["base_df"] = df
             st.success(report.resumo)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Erro ao ler BASE_COMPLETA: {exc}")
+        except SpacesStorageError as exc:
+            st.error(f"Falha ao carregar BASE_COMPLETA ativa: {exc}")
+    else:
+        base_file = st.file_uploader("BASE_COMPLETA.xlsx", type=["xlsx"], key="up_base")
+        if base_file is not None:
+            try:
+                df, report = _load_base_completa_cached(base_file, cfg.schema)
+                ss["base_df"] = df
+                st.success(report.resumo)
+                if storage is not None:
+                    arquivos_ativos.publicar_nova_versao(
+                        storage, pasta_base, base_file.name, base_file.getvalue(),
+                        auth.current_profile() or "desconhecido",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Erro ao ler BASE_COMPLETA: {exc}")
 
+    # --- 2. Tabela(s) RMC (uma por laboratório) ----------------------------
     st.subheader("2. Tabela(s) de preço RMC — uma por laboratório")
+    laboratorios_conhecidos = arquivos_ativos.listar_laboratorios_rmc(storage) if storage is not None else []
+
+    for lab in laboratorios_conhecidos:
+        if lab in ss["rmc_labs_excluidos_sessao"]:
+            col_removido, col_reincluir = st.columns([4, 1])
+            col_removido.caption(f"{lab} — removido desta sessão (continua salvo no Space).")
+            if col_reincluir.button("Reincluir", key=f"reincluir_rmc_{lab}"):
+                ss["rmc_labs_excluidos_sessao"].discard(lab)
+                st.rerun()
+            continue
+        pasta_lab = arquivos_ativos.pasta_rmc(lab)
+        ativo_lab = arquivos_ativos.ler_ativo(storage, pasta_lab)
+        if ativo_lab is None:
+            continue  # pasta existe mas ainda sem ativo.json — não deveria acontecer, defensivo
+        st.markdown(f"**{lab}**")
+        st.caption(f"Tabela atual: {ativo_lab.nome_arquivo}, enviada em {ativo_lab.enviado_em_fmt}")
+        modo_lab = st.radio(
+            "O que fazer?", ["Usar esta tabela", "Enviar nova versão"],
+            key=f"modo_rmc_{lab}", horizontal=True, label_visibility="collapsed",
+        )
+        if modo_lab == "Usar esta tabela":
+            try:
+                df, report = _carregar_rmc_ativo(pasta_lab, ativo_lab.nome_arquivo, lab, storage)
+                ss["rmc_dfs"][lab] = df
+                st.success(report.resumo)
+            except SpacesStorageError as exc:
+                st.error(f"Falha ao carregar tabela RMC ativa ({lab}): {exc}")
+        else:
+            novo_rmc_file = st.file_uploader(f"Nova versão — {lab}", type=["xlsx"], key=f"up_rmc_novo_{lab}")
+            if novo_rmc_file is not None:
+                try:
+                    conteudo = novo_rmc_file.getvalue()
+                    df, report = load_rmc_table(io.BytesIO(conteudo), lab, cfg.schema)
+                    ss["rmc_dfs"][lab] = df
+                    st.success(report.resumo)
+                    arquivos_ativos.publicar_nova_versao(
+                        storage, pasta_lab, novo_rmc_file.name, conteudo, auth.current_profile() or "desconhecido",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Erro ao ler tabela RMC: {exc}")
+
     with st.form("form_rmc_upload", clear_on_submit=True):
+        st.markdown("**Adicionar novo laboratório**")
         rmc_lab_name = st.text_input("Nome do laboratório desta tabela")
         rmc_file = st.file_uploader("Arquivo da tabela RMC", type=["xlsx"], key="up_rmc")
         submitted = st.form_submit_button("Adicionar tabela RMC")
         if submitted:
-            if not rmc_lab_name.strip():
-                st.error("Informe o nome do laboratório.")
+            nome = rmc_lab_name.strip()
+            erro_nome = file_manager.validar_nome_pasta(nome) if nome else "Informe o nome do laboratório."
+            if erro_nome:
+                st.error(erro_nome)
             elif rmc_file is None:
                 st.error("Selecione o arquivo.")
+            elif nome in laboratorios_conhecidos:
+                st.error(f"Laboratório '{nome}' já existe — use a seção acima para enviar uma nova versão.")
             else:
                 try:
-                    df, report = load_rmc_table(rmc_file, rmc_lab_name.strip(), cfg.schema)
-                    ss["rmc_dfs"][rmc_lab_name.strip()] = df
+                    conteudo = rmc_file.getvalue()
+                    df, report = load_rmc_table(io.BytesIO(conteudo), nome, cfg.schema)
+                    ss["rmc_dfs"][nome] = df
                     st.success(report.resumo)
+                    if storage is not None:
+                        arquivos_ativos.publicar_nova_versao(
+                            storage, arquivos_ativos.pasta_rmc(nome), rmc_file.name, conteudo,
+                            auth.current_profile() or "desconhecido",
+                        )
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Erro ao ler tabela RMC: {exc}")
 
     if ss["rmc_dfs"]:
-        st.caption(f"Laboratórios RMC carregados: {', '.join(ss['rmc_dfs'].keys())}")
-        remover = st.selectbox("Remover laboratório", ["—"] + list(ss["rmc_dfs"].keys()))
+        st.caption(f"Laboratórios RMC carregados nesta sessão: {', '.join(ss['rmc_dfs'].keys())}")
+        remover = st.selectbox("Remover laboratório desta sessão", ["—"] + list(ss["rmc_dfs"].keys()))
         if remover != "—" and st.button("Remover"):
             del ss["rmc_dfs"][remover]
+            # sem isso, o laço acima recarrega o laboratório sozinho no
+            # próximo rerun (qualquer interação na página reroda tudo, e o
+            # padrão pra quem já tem ativo é "Usar esta tabela") — o botão
+            # "Remover" pareceria não fazer nada.
+            if remover in laboratorios_conhecidos:
+                ss["rmc_labs_excluidos_sessao"].add(remover)
             st.rerun()
 
+    # --- 3. Movimentação das lojas -----------------------------------------
     st.subheader("3. Movimentação das lojas (export GPS Farma)")
-    lojas_file = st.file_uploader("Export de movimentação por CNPJ", type=["xlsx"], key="up_lojas")
-    if lojas_file is not None:
+    pasta_lojas = arquivos_ativos.pasta_lojas()
+    ativo_lojas = arquivos_ativos.ler_ativo(storage, pasta_lojas) if storage is not None else None
+
+    if ativo_lojas is not None:
+        st.caption(f"Movimentação atual: **{ativo_lojas.nome_arquivo}**, enviada em {ativo_lojas.enviado_em_fmt}")
+        modo_lojas = st.radio(
+            "O que fazer?", ["Usar este arquivo", "Enviar nova versão"],
+            key="modo_lojas", horizontal=True, label_visibility="collapsed",
+        )
+    else:
+        modo_lojas = "Enviar nova versão"
+
+    if modo_lojas == "Usar este arquivo":
         try:
-            df, report = _load_lojas_movimento_cached(lojas_file, cfg.schema)
+            df, report = _carregar_lojas_ativa_cached(
+                pasta_lojas, ativo_lojas.nome_arquivo, ativo_lojas.enviado_em, storage,
+            )
             ss["lojas_df"] = df
             st.success(report.resumo)
             with st.expander("Detalhe do que foi descartado na limpeza"):
                 st.json(report.motivos_descarte)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Erro ao ler movimentação das lojas: {exc}")
+        except SpacesStorageError as exc:
+            st.error(f"Falha ao carregar movimentação ativa: {exc}")
+    else:
+        lojas_file = st.file_uploader("Export de movimentação por CNPJ", type=["xlsx"], key="up_lojas")
+        if lojas_file is not None:
+            try:
+                df, report = _load_lojas_movimento_cached(lojas_file, cfg.schema)
+                ss["lojas_df"] = df
+                st.success(report.resumo)
+                with st.expander("Detalhe do que foi descartado na limpeza"):
+                    st.json(report.motivos_descarte)
+                if storage is not None:
+                    arquivos_ativos.publicar_nova_versao(
+                        storage, pasta_lojas, lojas_file.name, lojas_file.getvalue(),
+                        auth.current_profile() or "desconhecido",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Erro ao ler movimentação das lojas: {exc}")
 
     st.divider()
 
@@ -321,6 +559,256 @@ def pagina_dados():
                             st.rerun()
 
         st.success("Tabela principal recalculada. Veja nas próximas seções.")
+
+        st.divider()
+        st.subheader("Dados publicados")
+        st.caption(
+            "Publica a tabela final processada no Spaces — a partir daí, qualquer login "
+            "(consultor ou diretor) carrega esse snapshot automaticamente ao entrar, sem "
+            "precisar re-upload dos 3 arquivos a cada sessão."
+        )
+        if storage is None:
+            st.warning(
+                "Storage do Spaces não configurado nesta sessão — não é possível publicar.",
+                icon="⚠️",
+            )
+        elif st.button("Publicar dados", icon="📤"):
+            try:
+                metadata = _publicar_snapshot(ss["tabela_final"], ss["fornecedores_col_map"])
+                ss["snapshot_metadata"] = metadata
+                st.success(
+                    f"Dados publicados com sucesso — {len(ss['tabela_final'])} linha(s) "
+                    "disponíveis para todos os logins a partir de agora.",
+                    icon="✅",
+                )
+            except SpacesStorageError as exc:
+                st.error(f"Falha ao publicar: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Seção: Arquivos (gerenciador genérico, restrito a "Cota RMC/")
+# ---------------------------------------------------------------------------
+def _voltar_um_nivel(caminho: str) -> str:
+    partes = [p for p in caminho.rstrip("/").split("/") if p]
+    if not partes:
+        return caminho
+    partes.pop()
+    return "/".join(partes) + "/" if partes else ""
+
+
+def _destino_ocupado(caminho: str) -> bool:
+    """Checa se já existe algo no caminho de destino (arquivo OU pasta com
+    conteúdo) — usado antes de mover/restaurar pra nunca sobrescrever nada
+    silenciosamente."""
+    if caminho.endswith("/"):
+        listagem = storage.list_objects(caminho)
+        return bool(listagem.folders or listagem.files)
+    return storage.object_exists(caminho)
+
+
+@st.dialog("Nova pasta")
+def _dialog_nova_pasta():
+    caminho_atual = ss["gerenciador_caminho"]
+    st.caption(f"Dentro de: Cota RMC/{caminho_atual or '(raiz)'}")
+    nome = st.text_input("Nome da pasta", key="ger_dialog_nome_pasta")
+    if st.button("Criar"):
+        erro = file_manager.validar_nome_pasta(nome)
+        if erro:
+            st.error(erro)
+            return
+        try:
+            storage.create_folder_marker(caminho_atual + nome.strip())
+            st.rerun()
+        except SpacesStorageError as exc:
+            st.error(f"Falha ao criar pasta: {exc}")
+
+
+@st.dialog("Renomear pasta")
+def _dialog_renomear_pasta(pasta_relativa: str):
+    nome_atual = pasta_relativa.rstrip("/").rsplit("/", 1)[-1]
+    pasta_pai = _voltar_um_nivel(pasta_relativa)
+    st.caption(f"Pasta atual: Cota RMC/{pasta_relativa}")
+    novo_nome = st.text_input("Novo nome", value=nome_atual, key="ger_dialog_renomear_nome")
+    if st.button("Renomear"):
+        erro = file_manager.validar_nome_pasta(novo_nome)
+        if erro:
+            st.error(erro)
+            return
+        if novo_nome.strip() == nome_atual:
+            st.info("Nome igual ao atual — nada para renomear.")
+            return
+        destino = pasta_pai + novo_nome.strip() + "/"
+        if _destino_ocupado(destino):
+            st.error("Já existe algo com esse nome nesta pasta.")
+            return
+        try:
+            with st.spinner("Renomeando (copia e depois apaga cada arquivo — pode levar um instante)..."):
+                qtd = storage.rename_folder(pasta_relativa, destino)
+            st.success(f"Pasta renomeada ({qtd} arquivo(s) movidos).")
+            st.rerun()
+        except SpacesStorageError as exc:
+            st.error(f"Falha ao renomear: {exc}")
+
+
+@st.dialog("Mover arquivo")
+def _dialog_mover_arquivo(arquivo):
+    st.caption(f"Arquivo: {arquivo.name}")
+    todas_pastas = file_manager.listar_todas_pastas(storage)
+    opcoes = [(p if p else "(raiz) Cota RMC/") for p in todas_pastas]
+    escolha_idx = st.selectbox(
+        "Mover para", options=range(len(todas_pastas)), format_func=lambda i: opcoes[i], key="ger_dialog_mover_destino",
+    )
+    destino_pasta = todas_pastas[escolha_idx]
+    destino_key = destino_pasta + arquivo.name
+    if st.button("Mover"):
+        if destino_key == arquivo.key:
+            st.info("O arquivo já está nesta pasta.")
+            return
+        if _destino_ocupado(destino_key):
+            st.error("Já existe um arquivo com esse nome no destino.")
+            return
+        try:
+            storage.move_object(arquivo.key, destino_key)
+            st.success("Arquivo movido.")
+            st.rerun()
+        except SpacesStorageError as exc:
+            st.error(f"Falha ao mover: {exc}")
+
+
+@st.dialog("Inativar")
+def _dialog_confirmar_inativar(caminho: str, eh_pasta: bool):
+    tipo = "pasta" if eh_pasta else "arquivo"
+    st.warning(
+        f"Mover {tipo} **Cota RMC/{caminho}** para a lixeira (`_lixeira/`)? "
+        "Não é excluído de verdade — dá para restaurar depois.",
+        icon="⚠️",
+    )
+    col1, col2 = st.columns(2)
+    if col1.button("Confirmar", key="ger_confirmar_inativar"):
+        destino = file_manager.caminho_para_lixeira(caminho)
+        try:
+            if eh_pasta:
+                storage.rename_folder(caminho, destino)
+            else:
+                storage.move_object(caminho, destino)
+            st.success("Movido para a lixeira.")
+            st.rerun()
+        except SpacesStorageError as exc:
+            st.error(f"Falha ao inativar: {exc}")
+    if col2.button("Cancelar", key="ger_cancelar_inativar"):
+        st.rerun()
+
+
+@st.dialog("Restaurar")
+def _dialog_confirmar_restaurar(caminho: str, eh_pasta: bool):
+    original = file_manager.caminho_original_da_lixeira(caminho)
+    st.info(f"Restaurar para **Cota RMC/{original}**?", icon="↩️")
+    col1, col2 = st.columns(2)
+    if col1.button("Confirmar", key="ger_confirmar_restaurar"):
+        if _destino_ocupado(original):
+            st.error("Já existe algo no local original — não é possível restaurar automaticamente.")
+            return
+        try:
+            if eh_pasta:
+                storage.rename_folder(caminho, original)
+            else:
+                storage.move_object(caminho, original)
+            st.success("Restaurado.")
+            st.rerun()
+        except SpacesStorageError as exc:
+            st.error(f"Falha ao restaurar: {exc}")
+    if col2.button("Cancelar", key="ger_cancelar_restaurar"):
+        st.rerun()
+
+
+def pagina_gerenciador_arquivos():
+    # controle de acesso de verdade, não só ocultar do menu — mesmo padrão
+    # de guarda usado em pagina_dados().
+    if auth.current_profile() != auth.PERFIL_CONSULTOR:
+        st.error("Esta seção não está disponível para o seu perfil.", icon="🚫")
+        return
+
+    st.subheader("Arquivos")
+    st.caption(
+        "Navegador restrito à pasta **Cota RMC/** do bucket compartilhado — nunca acessa "
+        "pastas de outros projetos (Mapa da Farmácia, PEX 2.0 etc.), mesmo que estejam no "
+        "mesmo bucket."
+    )
+
+    if storage is None:
+        st.warning("Storage do Spaces não configurado nesta sessão.", icon="⚠️")
+        return
+
+    caminho_atual = ss["gerenciador_caminho"]
+
+    # breadcrumb
+    col_voltar, col_bread = st.columns([1, 6])
+    with col_voltar:
+        if st.button("‹ Voltar", disabled=(caminho_atual == "")):
+            ss["gerenciador_caminho"] = _voltar_um_nivel(caminho_atual)
+            st.rerun()
+    with col_bread:
+        st.caption(f"Cota RMC/{caminho_atual}")
+
+    if st.button("+ Nova pasta"):
+        _dialog_nova_pasta()
+
+    try:
+        listagem = storage.list_objects(caminho_atual)
+    except SpacesStorageError as exc:
+        st.error(f"Falha ao listar: {exc}")
+        return
+
+    if not listagem.folders and not listagem.files:
+        st.info("Pasta vazia.")
+
+    if listagem.folders or listagem.files:
+        c1, c2, c3, c4 = st.columns([4, 2, 2, 3])
+        c1.markdown("**Nome**")
+        c2.markdown("**Tamanho**")
+        c3.markdown("**Modificado em**")
+
+    for pasta in sorted(listagem.folders):
+        nome = pasta.rstrip("/").rsplit("/", 1)[-1]
+        na_lixeira = file_manager.esta_na_lixeira(pasta)
+        with st.container(key=f"ger-row-pasta-{pasta}"):
+            c1, c2, c3, c4 = st.columns([4, 2, 2, 3])
+            c1.markdown(f"📁 **{nome}**")
+            c2.write("—")
+            # S3 não expõe data de modificação pra "pastas" (são só prefixo de
+            # chave, não um objeto com metadado próprio) — coluna fica vazia
+            # de propósito, não é bug.
+            c3.write("—")
+            with c4:
+                b1, b2, b3 = st.columns(3)
+                if b1.button("Abrir", key=f"ger-abrir-{pasta}"):
+                    ss["gerenciador_caminho"] = pasta
+                    st.rerun()
+                if na_lixeira:
+                    if b2.button("Restaurar", key=f"ger-restaurar-{pasta}"):
+                        _dialog_confirmar_restaurar(pasta, eh_pasta=True)
+                else:
+                    if b2.button("Renomear", key=f"ger-renomear-{pasta}"):
+                        _dialog_renomear_pasta(pasta)
+                    if b3.button("Inativar", key=f"ger-inativar-{pasta}"):
+                        _dialog_confirmar_inativar(pasta, eh_pasta=True)
+
+    for arquivo in sorted(listagem.files, key=lambda f: f.name):
+        na_lixeira = file_manager.esta_na_lixeira(arquivo.key)
+        with st.container(key=f"ger-row-arquivo-{arquivo.key}"):
+            c1, c2, c3, c4 = st.columns([4, 2, 2, 3])
+            c1.markdown(f"📄 {arquivo.name}")
+            c2.write(file_manager.formatar_tamanho(arquivo.size))
+            c3.write(file_manager.formatar_data(arquivo.last_modified))
+            if na_lixeira:
+                if c4.button("Restaurar", key=f"ger-restaurar-{arquivo.key}"):
+                    _dialog_confirmar_restaurar(arquivo.key, eh_pasta=False)
+            else:
+                col_mover, col_inativar = c4.columns(2)
+                if col_mover.button("Mover", key=f"ger-mover-{arquivo.key}"):
+                    _dialog_mover_arquivo(arquivo)
+                if col_inativar.button("Inativar", key=f"ger-inativar-arq-{arquivo.key}"):
+                    _dialog_confirmar_inativar(arquivo.key, eh_pasta=False)
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +1013,7 @@ def _renderizar_ranking_lojas(caros_no_filtro: pd.DataFrame) -> None:
 
 def pagina_oportunidades_venda():
     if "tabela_final" not in ss:
-        st.info("Carregue os dados na seção **Dados** primeiro.")
+        _estado_vazio_tabela_final()
         return
 
     tabela_final = ss["tabela_final"]
@@ -646,7 +1134,7 @@ def pagina_oportunidades_venda():
 # ---------------------------------------------------------------------------
 def pagina_pedido_sugerido():
     if "tabela_final" not in ss:
-        st.info("Carregue os dados na seção **Dados** primeiro.")
+        _estado_vazio_tabela_final()
     else:
         st.subheader(f"Pedido sugerido para {ss['dias_cobertura']} dia(s) de cobertura")
         df = _filtros_tabela(ss["tabela_final"], "pedido")
@@ -662,7 +1150,7 @@ def pagina_pedido_sugerido():
 # ---------------------------------------------------------------------------
 def pagina_dashboard():
     if "tabela_final" not in ss:
-        st.info("Carregue os dados na seção **Dados** primeiro.")
+        _estado_vazio_tabela_final()
         return
 
     df = ss["tabela_final"]
@@ -766,6 +1254,7 @@ if eh_consultor:
         st.Page(pagina_oportunidades_venda, title="Oportunidades de Venda", icon="📋"),
         st.Page(pagina_pedido_sugerido, title="Pedido Sugerido", icon="🛒"),
         st.Page(pagina_dashboard, title="Dashboard", icon="📊"),
+        st.Page(pagina_gerenciador_arquivos, title="Arquivos", icon="🗂️"),
     ]
 else:
     paginas = [
@@ -778,4 +1267,12 @@ else:
 pg = st.navigation(paginas)
 pg.run()
 
-auth.render_logout_sidebar()
+_ultima_atualizacao_fmt = None
+_meta_publicacao = ss.get("snapshot_metadata")
+if _meta_publicacao and _meta_publicacao.get("publicado_em"):
+    try:
+        _ultima_atualizacao_fmt = datetime.fromisoformat(_meta_publicacao["publicado_em"]).strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        _ultima_atualizacao_fmt = None
+
+auth.render_logout_sidebar(_ultima_atualizacao_fmt)
